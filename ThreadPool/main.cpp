@@ -138,7 +138,7 @@ private:
             this->log("IDLE...");
 
             std::unique_lock<std::mutex> queueLocker(this->queueLock);
-            this->workerCondVar.wait(queueLocker, [&](){ return !this->queue.empty(); });
+            this->workerCondVar.wait(queueLocker, [&](){ return !this->queue.empty() || !this->isRunning.load(); });
 
             if (!this->isRunning.load() && this->queue.empty()) {
                 queueLocker.unlock();
@@ -150,19 +150,28 @@ private:
 
             queueLocker.unlock();
 
-            this->log("Captured task#" + std::to_string(task->GetID()));
+            this->log("Captured task #" + std::to_string(task->GetID()));
 
-            try {
-                task->Run();
-            } catch (const std::exception& e) {
-                std::throw_with_nested(e);
+            if (task->IsCompleted()) {
+                queueLocker.lock();
+                task->PushContinuationsIntoQueue(this->queue);
+                queueLocker.unlock();
+
+                this->log("Already finished task #" + std::to_string(task->GetID()) + ", performing continuations...");
+            } else {
+
+                try {
+                    task->Run();
+                } catch (const std::exception& e) {
+                    std::throw_with_nested(e);
+                }
+
+                queueLocker.lock();
+                task->PushContinuationsIntoQueue(this->queue);
+                queueLocker.unlock();
+
+                this->log("Finished task #" + std::to_string(task->GetID()));
             }
-
-            queueLocker.lock();
-            task->PushContinuationsIntoQueue(this->queue);
-            queueLocker.unlock();
-
-            this->log("Finished task#" + std::to_string(task->GetID()));
         }
     }
 
@@ -211,16 +220,15 @@ std::string boo(int a) {
 int main()
 {
 
-    Task<int, int>* task11 = new Task<int, int>(foo, 5);
-    ITask* task1 = task11;
+    Task<int, int>* task1 = new Task<int, int>(foo, 5);
     auto task2 = new Task<int, int>(goo, 10);
     auto  task3 = new Task<int, int>(foo, 20);
     auto  task4 = new Task<int, int>(bar, 3);
     auto  task5 = new Task<int, int>(goo, 4);
     auto  task6 = new Task<int, int>(bar, 2);
 
-    task11->ContinueWith<std::string>(boo);
-    auto res = task11->ContinueWith<std::string>(boo);
+    task1->ContinueWith<std::string>(boo);
+    auto res = task1->ContinueWith<std::string>(boo);
 
 
     ThreadPool threadPool(6);
@@ -236,6 +244,13 @@ int main()
     threadPool.Enqueue(task4);
     threadPool.Enqueue(task5);
     threadPool.Enqueue(task6);
+
+
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+
+    task1->ContinueWith<std::string>(boo);
+    threadPool.Enqueue(task1);
+
 
     threadPool.Shutdown();
 
