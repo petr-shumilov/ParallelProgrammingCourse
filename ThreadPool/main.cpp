@@ -5,125 +5,238 @@
 #include <mutex>
 #include <queue>
 #include <functional>
+#include <any>
+#include <atomic>
 
-std::condition_variable WorkerCondVar;
-std::mutex ThreadPoolQueueLock;
-std::mutex PrintLock;
-
-bool ThreadPoolRunning = true;
-using TaskFunction = std::function<int()>;
-int TaskIDCounter = 1;
 
 enum TaskStatus { TASK_NEW, TASK_RUNNING, TASK_FINISHED };
+int TaskIDCounter = 1;
 
-class Task {
+template<typename R, typename ...A>
+using TaskFunction = std::function<R(A...)>;
+
+
+class ITask {
 public:
-    Task(TaskFunction _taskFunction) : taskFunction(_taskFunction), taskStatus(TASK_NEW), id(TaskIDCounter++) {};
+    virtual ~ITask() = default;
+    virtual void SetArg(std::any) = 0;
+    virtual void Run() = 0;
+    virtual int GetID() = 0;
+    virtual bool IsCompleted() = 0;
+    virtual void PushContinuationsIntoQueue(std::queue<ITask*>&) = 0;
+};
 
-    int GetResult() {
-        while (this->taskStatus != TASK_FINISHED);
+template <typename R, typename ...A>
+class Task : public virtual ITask {
+public:
+    Task(TaskFunction<R, A...> _taskFunction, A... _args) : taskFunction(_taskFunction), args(_args...), taskStatus(TASK_NEW), id(TaskIDCounter++) {}
+
+    R GetResult() {
+        while (this->taskStatus != TASK_FINISHED) {
+            std::this_thread::yield();
+        }
         return this->result;
     }
 
-    void Run() {
+    void SetArg(std::any arg) override {
+        using argType = typename std::tuple_element<0, std::tuple<A...>>::type;
+        this->args = std::make_tuple(std::any_cast<argType>(arg));
+    }
+
+    void Run() override {
         this->taskStatus = TASK_RUNNING;
-        this->result = this->taskFunction();
+        this->result = std::apply([this](auto &&... args) -> R { return this->taskFunction(args...); }, this->args);
         this->taskStatus = TASK_FINISHED;
     }
 
-    int GetID() {
+    int GetID() override {
         return this->id;
     }
 
-    bool IsComplete() {
+    bool IsCompleted() override {
         return this->taskStatus == TASK_FINISHED;
+    }
+
+    template <typename NR>
+    Task<NR, R>* ContinueWith(TaskFunction<NR, R> continueFunc) {
+        auto newTask = new Task<NR, R>(continueFunc, {});
+        {
+            std::unique_lock<std::mutex> locker(this->continuationsQueueLock);
+            this->continuationsQueue.push(newTask);
+        }
+        return newTask;
+    }
+
+    void PushContinuationsIntoQueue(std::queue<ITask*>& q) override {
+        std::unique_lock<std::mutex> contQueueLocker(this->continuationsQueueLock);
+        while (!this->continuationsQueue.empty()) {
+            auto contTask = this->continuationsQueue.front();
+            this->continuationsQueue.pop();
+            contTask->SetArg(this->GetResult());
+            q.push(contTask);
+        }
     }
 
 private:
     int id;
     TaskStatus taskStatus;
-    TaskFunction taskFunction;
-    int result;
+    TaskFunction<R, A...> taskFunction;
+    std::tuple<A...> args;
+    R result;
+    std::mutex continuationsQueueLock;
+    std::queue<ITask*> continuationsQueue;
 };
 
-std::queue<Task*> ThreadPoolQueue;
 
 
-void Worker() {
-    while (ThreadPoolRunning) {
-        {
-            std::unique_lock<std::mutex> locker(PrintLock);
-            std::cout << "[" << std::this_thread::get_id() << "]: IDLE... \n";
-        }
-        std::unique_lock<std::mutex> locker(ThreadPoolQueueLock);
-        WorkerCondVar.wait(locker, [&](){ return !ThreadPoolQueue.empty(); });
-
-
-        auto task = ThreadPoolQueue.front();
-        ThreadPoolQueue.pop();
-
-        locker.unlock();
-
-        {
-            std::unique_lock<std::mutex> locker(PrintLock);
-            std::cout << "[" << std::this_thread::get_id() << "]: Captured task#" << task->GetID() << "\n";
-        }
-
-
-        task->Run();
-
-
-        {
-            std::unique_lock<std::mutex> locker(PrintLock);
-            std::cout << "[" << std::this_thread::get_id() << "]: Finished task#" << task->GetID() << std::endl;
+class ThreadPool {
+public:
+    ThreadPool(int threadsNum) : isRunning(true) {
+        for (auto _ = threadsNum; _--;) {
+            this->workerThreads.emplace_back(std::thread(&ThreadPool::workerRun, this));
         }
     }
-}
+
+    void Enqueue(ITask* task) {
+        if (this->isRunning.load()) {
+            std::unique_lock <std::mutex> queueLocker(this->queueLock);
+            this->queue.push(task);
+            this->workerCondVar.notify_all();
+        }
+    }
+
+    void Join() {
+        for (std::thread& t : this->workerThreads) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    }
+
+    void Shutdown() {
+        this->isRunning.store(false);
+        this->workerCondVar.notify_all();
+        this->Join();
+    }
+
+    int NumOfRunningThreads() {
+        int num = 0;
+        for (std::thread& t : this->workerThreads) {
+            num += t.joinable() ? 1 : 0;
+        }
+        return num;
+    }
+
+    ~ThreadPool() {
+        this->Join();
+    }
+
+private:
+    void workerRun() {
+        while (this->isRunning.load() || !this->queueIsEmpty()) {
+
+            this->log("IDLE...");
+
+            std::unique_lock<std::mutex> queueLocker(this->queueLock);
+            this->workerCondVar.wait(queueLocker, [&](){ return !this->queue.empty(); });
+
+            if (!this->isRunning.load() && this->queue.empty()) {
+                queueLocker.unlock();
+                break;
+            }
+
+            auto task = this->queue.front();
+            this->queue.pop();
+
+            queueLocker.unlock();
+
+            this->log("Captured task#" + std::to_string(task->GetID()));
+
+            try {
+                task->Run();
+            } catch (const std::exception& e) {
+                std::throw_with_nested(e);
+            }
+
+            queueLocker.lock();
+            task->PushContinuationsIntoQueue(this->queue);
+            queueLocker.unlock();
+
+            this->log("Finished task#" + std::to_string(task->GetID()));
+        }
+    }
+
+    bool queueIsEmpty() {
+        std::unique_lock<std::mutex> queueLocker(this->queueLock);
+        return this->queue.empty();
+    }
+
+    void log(std::string text) {
+        std::unique_lock<std::mutex> locker(this->logLock);
+        std::cout << "[" << std::this_thread::get_id() << "]: " << text << std::endl;
+    }
 
 
-int foo() {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    return 10;
+private:
+    std::vector<std::thread> workerThreads;
+    std::queue<ITask*> queue;
+
+    std::condition_variable workerCondVar;
+    std::mutex queueLock;
+    std::mutex logLock;
+
+    std::atomic<bool> isRunning;
+};
+
+
+
+int foo(int a) {
+    std::this_thread::sleep_for(std::chrono::seconds(a));
+    return 1;
 }
-int goo() {
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+int goo(int a) {
+    std::this_thread::sleep_for(std::chrono::seconds(a));
     return 20;
 }
-int bar() {
-    std::this_thread::sleep_for(std::chrono::seconds(10));
+int bar(int a) {
+    std::this_thread::sleep_for(std::chrono::seconds(a));
     return 30;
+}
+
+std::string boo(int a) {
+    std::this_thread::sleep_for(std::chrono::seconds(a));
+    return "string";
 }
 
 int main()
 {
 
-    auto task1 = new Task(foo);
-    auto task2 = new Task(goo);
-    auto task3 = new Task(foo);
-    auto task4 = new Task(bar);
-    auto task5 = new Task(goo);
-    auto task6 = new Task(bar);
+    Task<int, int>* task11 = new Task<int, int>(foo, 5);
+    ITask* task1 = task11;
+    auto task2 = new Task<int, int>(goo, 10);
+    auto  task3 = new Task<int, int>(foo, 20);
+    auto  task4 = new Task<int, int>(bar, 3);
+    auto  task5 = new Task<int, int>(goo, 4);
+    auto  task6 = new Task<int, int>(bar, 2);
+
+    task11->ContinueWith<std::string>(boo);
+    auto res = task11->ContinueWith<std::string>(boo);
 
 
-    std::thread t1(Worker), t2(Worker), t3(Worker), t4(Worker);
+    ThreadPool threadPool(6);
+
+    std::cout<< "Number of workers: " << threadPool.NumOfRunningThreads() << "\n";
 
 
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
-    ThreadPoolQueue.push( task1);
-    ThreadPoolQueue.push( task2);
-    ThreadPoolQueue.push( task3);
-    ThreadPoolQueue.push( task4);
-    ThreadPoolQueue.push( task5);
-    ThreadPoolQueue.push( task6);
+    threadPool.Enqueue(task1);
+    threadPool.Enqueue(task2);
+    threadPool.Enqueue(task3);
+    threadPool.Enqueue(task4);
+    threadPool.Enqueue(task5);
+    threadPool.Enqueue(task6);
 
+    threadPool.Shutdown();
 
-    WorkerCondVar.notify_all();
-
-
-
-    t1.join();
-    t2.join();
-    t3.join();
-    t4.join();
 }
